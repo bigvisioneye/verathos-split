@@ -107,11 +107,17 @@ Selected via a serve-mode flag; local vLLM stays the default.
 ## Config flags (neurons/config.py + miner.py argparse)
 
 ```
---capacity-audit-backend-url URL   # set -> RemoteAuditComputeBackend
---gpu-pool-url URL                 # set -> proxy serving instead of local vLLM
+# audit compute (choose one; balancer takes precedence)
+--capacity-audit-balancer-url URL    # set -> Pick1AuditComputeBackend (lease a worker via verathos-monitor)
+--capacity-audit-balancer-api-key K  # bearer key for the balancer
+--capacity-audit-backend-url URL     # set -> RemoteAuditComputeBackend (orchestration scheduler)
+# inference serving (choose one; pick-url preferred)
+--gpu-pick-url URL                   # set -> proxy asks a balancer /api/pick per request
+--gpu-pool-url URL                   # set -> proxy forwards to a static pool/LB
 ```
 
-Both default empty -> unchanged canonical single-box miner.
+All default empty -> unchanged canonical single-box miner. Backend selection
+precedence in `main()`: Pick1 (balancer) > Remote (backend-url) > Local.
 
 ## Run model
 
@@ -167,3 +173,56 @@ the proof SSE byte-for-byte. Slot identity comes from CLI/env
    never `invalid_payload`.
 3. Split serving: `--gpu-pool-url` set, confirm inference proofs verify and
    receipts round-trip (`POST /epoch/receipt` -> `GET /epoch/{n}/receipts`).
+
+## Full topology & deployment (self-contained in this repo)
+
+Three machine roles. All Python components live in this repo; the two balancers
+live in the separate `verathos-monitor` project (they only pick/lease — no
+identity or proof logic).
+
+```
+  Frontend VPS (GPU-less)        GPU worker box(es)          Inference GPU box(es)
+  ─────────────────────         ──────────────────          ─────────────────────
+  neurons.miner                  miner_gpu_control           verallm.api.server
+   + neurons.split_serving        .split_audit_gpu_runner     (vLLM + proof plugin)
+  nginx TLS  :443/19101          /split-audit/v1/*           /chat,/inference
+        │                              ▲                            ▲
+        │ audit compute (lease)        │ pick1                      │ /api/pick
+        └───────────────▶ verathos-monitor pick1 balancer ─────────┘
+                          verathos-monitor inference pick balancer
+```
+
+Per-role components **in this repo**:
+
+| Role | Entry point | Setup | pm2 example |
+|------|-------------|-------|-------------|
+| Frontend miner | `neurons.miner` (+ `neurons.split_serving` proxy) | `deploy/frontend-tls-setup.sh`, `deploy/run-split-slot.example.sh` | `ecosystem.split.example.js` |
+| Audit worker | `miner_gpu_control.split_audit_gpu_runner` | `deploy/worker-gpu-setup.sh` | `ecosystem.worker.example.js` |
+| Inference | `verallm.api.server` | `deploy/inference-gpu-setup.sh` | — |
+
+`miner_gpu_control` (the audit worker) imports `neurons.capacity_audit*`, so it
+ships as a top-level package alongside `neurons/` and `verallm/` and is declared
+in `pyproject.toml` packages.
+
+### Compiled-wheel / CUDA constraints (must match, or imports fail)
+
+The proof extensions are prebuilt wheels in `dist/` with strict pairings:
+
+- **Audit worker:** `torch==2.11.0+cu128`. The `hot_capacity_workspace_cuda` /
+  `zkllm` natives link **CUDA 12** (`libcudart.so.12`); the default cu130 wheel
+  fails at import. Also needs `blake3` (zkllm Merkle/Fiat-Shamir hashing).
+- **Inference:** `vllm==0.19.1` (pins **torch 2.10**) + `torch==2.10.0+cu128`,
+  matching zkllm's `.torch210` variant. Also needs `blake3`.
+- A CUDA-13 driver runs the CUDA-12 runtime fine (forward compatible).
+
+The `deploy/*-setup.sh` scripts encode these and verify imports before printing
+the start command.
+
+### Claimed GPU class
+
+The slot advertises a *lesser* GPU class than the physical inference GPU (e.g.
+`NVIDIA A40` while the pool runs A100s) via `SPLIT_GPU_NAME/CLASS/VRAM_GB/
+COMPUTE_CAPABILITY`. The audit enforces class by **timing** only (the proof is
+deterministic math), so under-claiming is legitimate and gives timing margin.
+The claimed class MUST equal the audit worker's registered `gpu_class` in the
+pick1 balancer, or the lease won't match.

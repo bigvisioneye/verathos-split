@@ -126,7 +126,7 @@ verathos = "neurons.cli:main"
 verathos = "verallm.vllm_plugin:register_verathos_plugin"
 
 [tool.setuptools.packages.find]
-include = ["verallm*", "trainllm*", "neurons*"]
+include = ["verallm*", "trainllm*", "neurons*", "miner_gpu_control*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

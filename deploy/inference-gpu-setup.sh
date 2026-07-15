@@ -4,15 +4,17 @@
 #  Installs vLLM + verallm and verifies imports. Does NOT start the server or
 #  download the model (that command is printed at the end; first run downloads).
 #
-#  NOTE: the box is CUDA 13 / Python 3.12. vLLM wheels can be version-sensitive
-#  for that combo. If `pip install vllm` fails or pulls a torch that reports
-#  cuda_avail False, pin a version (e.g. `vllm==0.10.*`) matching a torch build
-#  that supports this driver — iterate here on the box, it's the one risky step.
+#  VERSION CONSTRAINT (hard-won): the zkllm proof wheel is built against
+#  torch 2.10 ABI + CUDA 12. vLLM 0.19.1 is the version whose torch dependency
+#  is exactly torch 2.10 (installed as +cu128 = CUDA 12.8 here), so zkllm's
+#  native lib loads. Do NOT let pip pull a newer vLLM — it drags in a torch
+#  (2.11+/cu130) that breaks zkllm with "libcudart.so.12: cannot open ...".
+#  A CUDA-13 driver runs the CUDA-12 runtime fine (forward compatible).
 #
 #  Prereq: /root/verathos_subnet contains the code + dist/*.whl (rsync'd).
 # =============================================================================
 set -euo pipefail
-ROOT=/root/verathos_subnet
+ROOT="${ROOT:-/root/verathos_subnet}"
 cd "$ROOT"
 test -f verallm/api/server.py || { echo "ERROR: verallm code missing — re-transfer the repo"; exit 1; }
 
@@ -20,9 +22,10 @@ python3 -m venv .venv 2>/dev/null || true
 VP="$ROOT/.venv/bin"
 "$VP/pip" install -q --upgrade pip wheel setuptools
 
-# 1) vLLM (heavy; pulls a matching torch). Pin a version here if this box's
-#    CUDA/py combo needs it.
-"$VP/pip" install vllm
+# 1) vLLM — PINNED. Pulls torch 2.10; force the +cu128 (CUDA 12) build so the
+#    zkllm proof wheel's libcudart.so.12 resolves.
+"$VP/pip" install vllm==0.19.1
+"$VP/pip" install -q torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 
 # 2) verathos runtime deps + compiled wheels (cp312)
 "$VP/pip" install -q fastapi "uvicorn[standard]" httpx pydantic \
@@ -47,6 +50,6 @@ Start the inference server on container port 8080 (first run downloads the model
       --max-model-len 262144 --host 0.0.0.0 --port 8080
 
 Then verify locally:  curl -s localhost:8080/health
-Externally it is:      http://38.64.63.84:20448/health
-(this is the frontend's --gpu-pool-url)
+Register the EXTERNAL url (host:mapped-port) in the verathos-monitor inference
+pick balancer; that balancer's /api/pick is the frontend's --gpu-pick-url.
 EOF
