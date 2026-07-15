@@ -401,6 +401,29 @@ class MinerNeuron:
     _AWQ_GEMM_HINT_EXIT = 43
 
     def _server_cmd(self, server_args: list[str]) -> list[str]:
+        # Split miner: serve inference through the proxy (which forwards to a GPU
+        # pool) instead of a local vLLM. The proxy answers the same endpoints on
+        # the same local port, so wait_for_health and validators are unaffected.
+        pool_url = str(getattr(self.config, "gpu_pool_url", "") or "").strip()
+        pick_url = str(getattr(self.config, "gpu_pick_url", "") or "").strip()
+        if pool_url or pick_url:
+            cmd = [
+                sys.executable, "-m", "neurons.split_serving",
+                "--host", "0.0.0.0",
+                "--port", str(_extract_server_port(server_args)),
+            ]
+            if pool_url:
+                cmd.extend(["--gpu-pool-url", pool_url])
+            if pick_url:
+                cmd.extend(["--gpu-pick-url", pick_url])
+            model_id = _extract_named_arg(server_args, "--model")
+            if model_id:
+                cmd.extend(["--model", model_id])
+            if getattr(self, "evm_addr", ""):
+                cmd.extend(["--evm-address", self.evm_addr])
+            if getattr(self, "evm_pk", ""):
+                cmd.extend(["--evm-private-key", self.evm_pk])
+            return cmd
         return [sys.executable, "-m", "verallm.api.server"] + server_args
 
     @staticmethod
@@ -1222,6 +1245,29 @@ def parse_args():
     parser.add_argument("--capacity-audit-validator-urls", default=None,
                         help="Emergency override for capacity artifact targets. "
                              "By default miners discover validator audit endpoints from chain state.")
+    parser.add_argument("--capacity-audit-backend-url", default=None,
+                        help="Split miner: route capacity-audit GPU compute to a shared audit "
+                             "scheduler at this URL instead of running the workload on the local "
+                             "GPU. Identity, signing, and artifact publishing stay local. Empty "
+                             "(default) runs the workload locally.")
+    parser.add_argument("--capacity-audit-balancer-url", default=None,
+                        help="Split miner: route capacity-audit GPU compute via a pick1/lease "
+                             "balancer (e.g. verathos-monitor). The balancer picks a free worker "
+                             "of the claimed GPU class; this miner drives that worker's "
+                             "/split-audit/v1/* directly and releases the lease. Takes precedence "
+                             "over --capacity-audit-backend-url.")
+    parser.add_argument("--capacity-audit-balancer-api-key", default=None,
+                        help="Bearer API key for --capacity-audit-balancer-url.")
+    parser.add_argument("--gpu-pool-url", default=None,
+                        help="Split miner: serve inference through a local proxy that forwards "
+                             "/chat and /inference to this GPU pool (a vLLM server, a load "
+                             "balancer over several, or a scheduler exposing those paths) instead "
+                             "of starting a local vLLM. Identity, auth, and receipts stay local. "
+                             "Empty (default) starts the local vLLM server.")
+    parser.add_argument("--gpu-pick-url", default=None,
+                        help="Split miner: inference GPU pick balancer URL (e.g. verathos-monitor "
+                             "http://HOST:3840/api/pick). The proxy queries it per request to get "
+                             "the best inference GPU, instead of a static --gpu-pool-url.")
     parser.add_argument("--capacity-audit-windows-per-epoch", type=int, default=None,
                         help="Number of deterministic capacity-audit windows per subnet epoch.")
     parser.add_argument("--capacity-audit-max-drain-fraction", type=float, default=None,
@@ -1396,6 +1442,14 @@ def _extract_server_port(server_args: list[str]) -> int:
     return 8000  # matches verallm.api.server default
 
 
+def _extract_named_arg(server_args: list[str], flag: str) -> str:
+    """Return the value following ``flag`` in server args, or '' if absent."""
+    for i, arg in enumerate(server_args):
+        if arg == flag and i + 1 < len(server_args):
+            return str(server_args[i + 1])
+    return ""
+
+
 def _clear_stale_compile_caches() -> None:
     """Clear torch.compile / Triton caches to prevent stale kernels.
 
@@ -1463,6 +1517,10 @@ def main():
         chain_config=resolved_chain_path,
         subtensor_network=args.subtensor_network,
         capacity_audit_required=bool(getattr(config, "capacity_audit_enabled", False)),
+        allow_no_gpu=bool(
+            str(getattr(args, "gpu_pool_url", "") or "").strip()
+            or str(getattr(args, "gpu_pick_url", "") or "").strip()
+        ),
     )
     bt.logging.info(f"Model config: {resolved.model_id} quant={resolved.quant} ctx={resolved.max_context_len}")
 
@@ -1498,6 +1556,16 @@ def main():
         config.capacity_audit_enabled = True
     if getattr(args, "capacity_audit_validator_urls", None):
         config.capacity_audit_validator_urls = args.capacity_audit_validator_urls
+    if getattr(args, "capacity_audit_backend_url", None):
+        config.capacity_audit_backend_url = args.capacity_audit_backend_url
+    if getattr(args, "capacity_audit_balancer_url", None):
+        config.capacity_audit_balancer_url = args.capacity_audit_balancer_url
+    if getattr(args, "capacity_audit_balancer_api_key", None):
+        config.capacity_audit_balancer_api_key = args.capacity_audit_balancer_api_key
+    if getattr(args, "gpu_pool_url", None):
+        config.gpu_pool_url = args.gpu_pool_url
+    if getattr(args, "gpu_pick_url", None):
+        config.gpu_pick_url = args.gpu_pick_url
     if getattr(args, "capacity_audit_windows_per_epoch", None) is not None:
         config.capacity_audit_windows_per_epoch = args.capacity_audit_windows_per_epoch
     if getattr(args, "capacity_audit_max_drain_fraction", None) is not None:
@@ -1678,7 +1746,14 @@ def main():
         bt.logging.warning(f"Could not query actual context from server — using registry value {resolved.max_context_len}")
         reg_context = resolved.max_context_len
 
-    if getattr(config, "capacity_audit_enabled", False):
+    # Split serving runs on a GPU-less VPS, so the local-GPU recommended-model
+    # gate does not apply; the pool's GPU serves and the capacity-audit path
+    # validates claimed capability separately.
+    _split_serving = bool(
+        str(getattr(config, "gpu_pool_url", "") or "").strip()
+        or str(getattr(config, "gpu_pick_url", "") or "").strip()
+    )
+    if getattr(config, "capacity_audit_enabled", False) and not _split_serving:
         if on_chain_models is None:
             bt.logging.error(
                 "Capacity audit model gate requires an on-chain ModelRegistry model list"
@@ -1750,6 +1825,32 @@ def main():
             from neurons.capacity_audit_miner import CapacityAuditMinerWorker
             from verallm.chain.model_registry import ModelRegistryClient
 
+            # Split miner: route audit GPU compute off this process while
+            # identity/signing/publishing stay local. A pick1/lease balancer
+            # takes precedence over an orchestration scheduler; empty for both
+            # keeps the default local-GPU backend, so canonical miners are
+            # unchanged.
+            audit_backend = None
+            balancer_url = str(getattr(config, "capacity_audit_balancer_url", "") or "").strip()
+            backend_url = str(getattr(config, "capacity_audit_backend_url", "") or "").strip()
+            if balancer_url:
+                from neurons.capacity_audit_backend import Pick1AuditComputeBackend
+
+                audit_backend = Pick1AuditComputeBackend(
+                    balancer_url,
+                    api_key=str(getattr(config, "capacity_audit_balancer_api_key", "") or ""),
+                )
+                bt.logging.info(
+                    f"Capacity audit compute routed via pick1 balancer: {balancer_url}"
+                )
+            elif backend_url:
+                from neurons.capacity_audit_backend import RemoteAuditComputeBackend
+
+                audit_backend = RemoteAuditComputeBackend(backend_url)
+                bt.logging.info(
+                    f"Capacity audit compute routed to remote scheduler: {backend_url}"
+                )
+
             model_client = ModelRegistryClient(config)
             neuron._capacity_audit_worker = CapacityAuditMinerWorker(
                 config=config,
@@ -1766,6 +1867,7 @@ def main():
                 local_health_url=local_health_url,
                 audit_state_file=capacity_audit_state_file,
                 poll_interval_s=_capacity_audit_worker_poll_interval(config),
+                audit_backend=audit_backend,
             )
             neuron._capacity_audit_worker.start()
         except Exception as e:

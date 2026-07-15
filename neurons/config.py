@@ -104,6 +104,11 @@ class NeuronConfig(ChainConfig):
     capacity_audit_public_url: str = ""  # validator-owned public ingest URL published through axon metadata
     capacity_audit_serve_axon: bool = True  # publish direct ingest IP:port via Bittensor axon metadata
     capacity_audit_validator_urls: str = ""  # emergency manual override for miner artifact targets
+    capacity_audit_backend_url: str = ""  # split miner: route audit GPU compute to a shared audit scheduler (empty = local GPU)
+    capacity_audit_balancer_url: str = ""  # split miner: route audit GPU compute via a pick1/lease balancer (takes precedence over backend_url)
+    capacity_audit_balancer_api_key: str = ""  # bearer key for the pick1 balancer
+    gpu_pool_url: str = ""  # split miner: serve inference via a proxy forwarding to this static GPU pool (empty = local vLLM)
+    gpu_pick_url: str = ""  # split miner: inference GPU pick balancer (e.g. verathos-monitor /api/pick); proxy queries it per request
     capacity_audit_worker_poll_s: float = 2.0
     capacity_audit_cohort_min: int = 100
     capacity_audit_cohort_fraction: float = 0.025
@@ -190,6 +195,11 @@ class NeuronConfig(ChainConfig):
             "capacity_audit_public_url": "VERATHOS_CAPACITY_AUDIT_PUBLIC_URL",
             "capacity_audit_serve_axon": "VERATHOS_CAPACITY_AUDIT_SERVE_AXON",
             "capacity_audit_validator_urls": "VERATHOS_CAPACITY_AUDIT_VALIDATOR_URLS",
+            "capacity_audit_backend_url": "VERATHOS_CAPACITY_AUDIT_BACKEND_URL",
+            "capacity_audit_balancer_url": "VERATHOS_CAPACITY_AUDIT_BALANCER_URL",
+            "capacity_audit_balancer_api_key": "VERATHOS_CAPACITY_AUDIT_BALANCER_API_KEY",
+            "gpu_pool_url": "VERATHOS_GPU_POOL_URL",
+            "gpu_pick_url": "VERATHOS_GPU_PICK_URL",
             "capacity_audit_worker_poll_s": "VERATHOS_CAPACITY_AUDIT_WORKER_POLL_S",
             "capacity_audit_cohort_min": "VERATHOS_CAPACITY_AUDIT_COHORT_MIN",
             "capacity_audit_cohort_fraction": "VERATHOS_CAPACITY_AUDIT_COHORT_FRACTION",

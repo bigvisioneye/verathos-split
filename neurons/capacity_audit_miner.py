@@ -45,6 +45,10 @@ from neurons.capacity_audit import (
     slot_id,
     transcript_root,
 )
+from neurons.capacity_audit_backend import (
+    CapacityAuditComputeBackend,
+    LocalWorkspaceAuditComputeBackend,
+)
 from neurons.capacity_audit_combined import COMBINED_PROOF_FORMAT
 from neurons.capacity_audit_discovery import CapacityAuditEndpointResolver
 from neurons.discovery import ActiveMiner
@@ -128,8 +132,15 @@ class CapacityAuditMinerWorker:
         local_health_url: str = "",
         audit_state_file: str = "",
         poll_interval_s: float = 2.0,
+        audit_backend: Optional[CapacityAuditComputeBackend] = None,
     ):
         self.config = config
+        # GPU-compute strategy. Defaults to the local subprocess backend so a
+        # canonical single-box miner is unchanged; a split miner injects a
+        # RemoteAuditComputeBackend to route compute to a shared audit scheduler.
+        self._audit_backend: CapacityAuditComputeBackend = (
+            audit_backend or LocalWorkspaceAuditComputeBackend()
+        )
         self.miner_client = miner_client
         self.model_client = model_client
         self.evm_address = evm_address.lower()
@@ -316,10 +327,13 @@ class CapacityAuditMinerWorker:
         if not self.evm_private_key:
             disabled("Capacity audit miner worker disabled: missing EVM private key")
             return
-        script_dir = self._workspace_script().parent
-        if not self._ensure_workspace_extension(script_dir):
+        # Readiness is backend-specific: the local backend needs the on-box
+        # hot-capacity workspace extension, while the pick1/remote backends run
+        # the compute on a pooled GPU worker and need nothing local here.
+        if not self._audit_backend.ensure_ready(self):
             disabled(
-                "Capacity audit miner worker disabled: hot-capacity workspace extension unavailable"
+                "Capacity audit miner worker disabled: compute backend not ready "
+                f"({type(self._audit_backend).__name__})"
             )
             return
         self._running = True
@@ -837,7 +851,9 @@ class CapacityAuditMinerWorker:
         last_wait_error = ""
         last_wait_error_logged_at = 0.0
         try:
-            prepared = self._prepare_audit_process(audit_slot, start_timeout_s=max(60.0, lead_wait_s + 60.0))
+            prepared = self._audit_backend.prepare(
+                self, audit_slot, start_timeout_s=max(60.0, lead_wait_s + 60.0)
+            )
             if prepared is None:
                 self._extend_busy_selection_until_current_head(audit_slot)
                 self._clear_audit_drain(audit_slot.audit_id)
@@ -846,7 +862,7 @@ class CapacityAuditMinerWorker:
             while self._running and time.time() < deadline:
                 if self._audit_already_started(audit_slot.audit_id):
                     if self._drop_prepared_audit(audit_slot.audit_id, prepared):
-                        self._terminate_prepared_audit(prepared)
+                        self._audit_backend.cancel(self, prepared)
                     return
                 now = time.time()
                 try:
@@ -914,7 +930,7 @@ class CapacityAuditMinerWorker:
             self._clear_audit_drain(audit_slot.audit_id)
             if prepared is not None:
                 self._drop_prepared_audit(audit_slot.audit_id, prepared)
-                self._terminate_prepared_audit(prepared)
+                self._audit_backend.cancel(self, prepared)
         except Exception as exc:
             bt.logging.warning(
                 f"Capacity audit start waiter failed: audit_id={audit_slot.audit_id[:12]} {exc}"
@@ -923,7 +939,7 @@ class CapacityAuditMinerWorker:
             self._clear_audit_drain(audit_slot.audit_id)
             if prepared is not None:
                 self._drop_prepared_audit(audit_slot.audit_id, prepared)
-                self._terminate_prepared_audit(prepared)
+                self._audit_backend.cancel(self, prepared)
         finally:
             if subtensor is not None:
                 self._close_subtensor(subtensor)
@@ -1454,80 +1470,68 @@ class CapacityAuditMinerWorker:
         audit_block_hash: bytes,
         subtensor=None,
         *,
-        prepared: Optional[PreparedAuditProcess] = None,
+        prepared: Optional[object] = None,
     ) -> None:
+        # GPU-compute mechanics (launch/release/poll/challenge/finalize) run
+        # through self._audit_backend; everything the validator checks — seed
+        # derivation, artifact construction, signing, publishing, and the
+        # on-chain proof-challenge-seed wait — stays here, in one place, so the
+        # local and remote (split) backends produce identical signed artifacts.
         if prepared is None:
             prepared = self._pop_prepared_audit(audit_slot.audit_id)
         else:
             self._drop_prepared_audit(audit_slot.audit_id, prepared)
         if not self._mark_audit_started_once(audit_slot.audit_id):
             if prepared is not None and self._drop_prepared_audit(audit_slot.audit_id, prepared):
-                self._terminate_prepared_audit(prepared)
+                self._audit_backend.cancel(self, prepared)
             return
         self._mark_audit_drain(audit_slot, phase="running")
         proof_seed = derive_proof_seed(audit_block_hash, slot_id(audit_slot.slot), 0)
+
+        def _abort() -> None:
+            self._extend_busy_selection_until_current_head(audit_slot, subtensor=subtensor)
+            self._clear_audit_drain(audit_slot.audit_id)
+
+        # Prepare on demand if the hot-start pre-launch was not carried in. The
+        # backend fails closed (returns None / raises) rather than fabricating a
+        # proof, so a missing GPU degrades this slot to a clean no_show.
         if prepared is None:
-            lease = self._audit_lease(audit_slot, subtensor)
-            out_dir = Path(tempfile.mkdtemp(prefix="verathos_capacity_audit_"))
-            challenge_file = out_dir / f"{lease}_challenge.txt"
-            script = self._workspace_script()
-            if not self._ensure_workspace_extension(script.parent):
+            try:
+                prepared = self._audit_backend.prepare(self, audit_slot, start_timeout_s=30.0)
+            except Exception as exc:
                 bt.logging.warning(
-                    f"Capacity audit workload skipped: workspace extension unavailable "
+                    f"Capacity audit backend prepare failed: audit_id={audit_slot.audit_id[:12]} {exc}"
+                )
+                prepared = None
+            if prepared is None:
+                bt.logging.warning(
+                    f"Capacity audit workload skipped: backend could not prepare "
                     f"audit_id={audit_slot.audit_id[:12]}"
                 )
-                self._extend_busy_selection_until_current_head(audit_slot, subtensor=subtensor)
-                self._clear_audit_drain(audit_slot.audit_id)
+                _abort()
                 return
-            cmd = self._workspace_audit_command(
-                script=script,
-                audit_slot=audit_slot,
-                lease=lease,
-                out_dir=out_dir,
-                challenge_file=challenge_file,
-                proof_seed=proof_seed,
-            )
-            env = self._workspace_build_env(script.parent)
-            bt.logging.info(
-                f"Capacity audit running workload: audit_id={audit_slot.audit_id[:12]} "
-                f"passes={audit_slot.passes} workload={(audit_slot.workload_spec or {}).get('workload_version')}"
-            )
-            try:
-                proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            except Exception as exc:
-                bt.logging.warning(f"Capacity audit workload failed to start: {exc}")
-                self._extend_busy_selection_until_current_head(audit_slot, subtensor=subtensor)
-                self._clear_audit_drain(audit_slot.audit_id)
-                return
-        else:
-            proc = prepared.proc
-            out_dir = prepared.out_dir
-            lease = prepared.lease
-            challenge_file = prepared.challenge_file
-            if proc.poll() is not None:
-                stdout, stderr = proc.communicate()
-                bt.logging.warning(
-                    f"Capacity audit hot-start workload exited before B_start: "
-                    f"audit_id={audit_slot.audit_id[:12]} rc={proc.returncode} "
-                    f"stderr_tail={stderr[-500:]} stdout_tail={stdout[-300:]}"
-                )
-                self._extend_busy_selection_until_current_head(audit_slot, subtensor=subtensor)
-                self._clear_audit_drain(audit_slot.audit_id)
-                return
-            start_payload = {
-                "seed_hex": proof_seed,
-                "audit_id": audit_slot.audit_id,
-                "B_start": audit_slot.audit_block,
-                "t": time.time(),
-            }
-            tmp_start = prepared.start_file.with_suffix(prepared.start_file.suffix + ".tmp")
-            tmp_start.write_text(json.dumps(start_payload, sort_keys=True) + "\n")
-            os.replace(tmp_start, prepared.start_file)
-            bt.logging.info(
-                f"Capacity audit released hot-start workload: audit_id={audit_slot.audit_id[:12]} "
-                f"passes={audit_slot.passes} workload={(audit_slot.workload_spec or {}).get('workload_version')}"
-            )
 
+        try:
+            self._audit_backend.start(
+                self,
+                prepared,
+                seed_hex=proof_seed,
+                audit_id=audit_slot.audit_id,
+                b_start=audit_slot.audit_block,
+            )
+        except Exception as exc:
+            bt.logging.warning(
+                f"Capacity audit workload failed to start: audit_id={audit_slot.audit_id[:12]} {exc}"
+            )
+            self._audit_backend.cancel(self, prepared)
+            _abort()
+            return
+        bt.logging.info(
+            f"Capacity audit running workload: audit_id={audit_slot.audit_id[:12]} "
+            f"passes={audit_slot.passes} workload={(audit_slot.workload_spec or {}).get('workload_version')}"
+        )
+
+        lease = prepared.lease
         pass0_sent = False
         final_sent = False
         pass0_root = ""
@@ -1539,8 +1543,7 @@ class CapacityAuditMinerWorker:
             + float(self.runtime_cfg.payload_deadline_s or 0.0)
         )
         deadline = time.time() + max(120.0, audit_slot.deadline_s + 90.0 + challenge_wait_s)
-        pass0_path = out_dir / f"{lease}_pass0.json"
-        final_path = out_dir / f"{lease}_final_timing.json"
+        poll_interval = max(0.01, float(getattr(self._audit_backend, "poll_interval_s", 0.05)))
 
         def publish_pass0(root: str) -> bool:
             nonlocal pass0_root, pass0_sent
@@ -1552,28 +1555,27 @@ class CapacityAuditMinerWorker:
             pass0_sent = True
             return True
 
-        def read_pass0_file() -> bool:
-            if not pass0_path.exists():
-                return False
-            data = json.loads(pass0_path.read_text())
-            raw_root = data.get("root")
-            if raw_root in (None, "", []):
-                return False
-            return publish_pass0(_root_hex(raw_root))
-
         while time.time() < deadline:
-            if not pass0_sent:
-                read_pass0_file()
-            if not final_sent and final_path.exists():
-                data = json.loads(final_path.read_text())
-                final_timing_data = data if isinstance(data, dict) else {}
+            try:
+                progress = self._audit_backend.poll(self, prepared)
+            except Exception as exc:
+                bt.logging.debug(
+                    f"Capacity audit poll error: audit_id={audit_slot.audit_id[:12]} {exc}"
+                )
+                time.sleep(poll_interval)
+                continue
+
+            if progress.pass0_root and not pass0_sent:
+                publish_pass0(progress.pass0_root)
+
+            if progress.final_timing and not final_sent:
+                final_timing_data = progress.final_timing if isinstance(progress.final_timing, dict) else {}
                 if not pass0_sent:
-                    if not read_pass0_file():
-                        raw_pass0_root = final_timing_data.get("pass0_root")
-                        if raw_pass0_root:
-                            publish_pass0(_root_hex(raw_pass0_root))
-                final_root = _root_hex(data.get("root") or [])
-                transcript = str(data.get("transcript_root") or "")
+                    raw_pass0_root = final_timing_data.get("pass0_root")
+                    if raw_pass0_root:
+                        publish_pass0(_root_hex(raw_pass0_root))
+                final_root = _root_hex(final_timing_data.get("root") or [])
+                transcript = str(final_timing_data.get("transcript_root") or "")
                 if not transcript:
                     transcript = transcript_root([pass0_root, final_root])
                 self._publish_receipt(
@@ -1600,50 +1602,47 @@ class CapacityAuditMinerWorker:
                         timeout_s=challenge_wait_s,
                     )
                     if challenge_seed:
-                        self._write_text_atomic(challenge_file, challenge_seed)
+                        self._audit_backend.submit_challenge(
+                            self, prepared, challenge_seed=challenge_seed
+                        )
                     else:
                         bt.logging.warning(
                             f"Capacity audit proof challenge unavailable: "
                             f"audit_id={audit_slot.audit_id[:12]} B_proof={audit_slot.proof_challenge_block}"
                         )
                 break
-            if proc.poll() is not None and final_sent:
+
+            if progress.error:
+                bt.logging.warning(
+                    f"Capacity audit backend reported error: "
+                    f"audit_id={audit_slot.audit_id[:12]} {progress.error}"
+                )
                 break
-            if proc.poll() is not None and not final_path.exists():
+            if progress.done and not final_sent:
                 break
-            time.sleep(0.02)
+            time.sleep(poll_interval)
 
         proof_assembly_timeout = max(5.0, float(self.runtime_cfg.payload_deadline_s or 0.0) + 30.0)
         try:
-            stdout, stderr = proc.communicate(timeout=proof_assembly_timeout)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
-            try:
-                stdout, stderr = proc.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout, stderr = proc.communicate()
+            final_summary = self._audit_backend.finalize(
+                self, prepared, timeout_s=proof_assembly_timeout
+            )
+        except Exception as exc:
+            bt.logging.warning(
+                f"Capacity audit finalize failed: audit_id={audit_slot.audit_id[:12]} {exc}"
+            )
+            final_summary = {}
+        if not isinstance(final_summary, dict):
+            final_summary = {}
+
         if not final_sent:
             bt.logging.warning(
                 f"Capacity audit workload did not produce final receipt: "
-                f"rc={proc.poll()} stderr_tail={stderr[-500:]} stdout_tail={stdout[-300:]}"
+                f"audit_id={audit_slot.audit_id[:12]}"
             )
         elif not pass0_sent:
             bt.logging.warning(f"Capacity audit final sent without pass0 for audit_id={audit_slot.audit_id[:12]}")
         else:
-            final_summary = {}
-            final_summary_path = out_dir / f"{lease}_final.json"
-            if final_summary_path.exists():
-                try:
-                    final_summary = json.loads(final_summary_path.read_text())
-                except Exception:
-                    final_summary = {}
-            else:
-                bt.logging.warning(
-                    f"Capacity audit workload missing final proof summary: "
-                    f"audit_id={audit_slot.audit_id[:12]} rc={proc.poll()} "
-                    f"stderr_tail={stderr[-500:]} stdout_tail={stdout[-300:]}"
-                )
             proof_payload = self._proof_payload_artifact(
                 audit_slot,
                 pass0_root=pass0_root,
@@ -1670,8 +1669,7 @@ class CapacityAuditMinerWorker:
                         f"audit_id={audit_slot.audit_id[:12]} "
                         "slot was not scheduled or endpoints were unavailable"
                     )
-        self._extend_busy_selection_until_current_head(audit_slot, subtensor=subtensor)
-        self._clear_audit_drain(audit_slot.audit_id)
+        _abort()
 
     def _base_artifact(self, audit_slot: MinerAuditSlot) -> dict:
         slot = audit_slot.slot

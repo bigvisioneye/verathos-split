@@ -228,6 +228,7 @@ def resolve_model_config(
     chain_config: Optional[str] = None,
     subtensor_network: Optional[str] = None,
     capacity_audit_required: bool = False,
+    allow_no_gpu: bool = False,
 ) -> ResolvedModel:
     """Resolve a miner's model configuration with cascading fallback.
 
@@ -267,7 +268,9 @@ def resolve_model_config(
     # --- GPU detection (always needed for registry lookups) ---
     gpu_info = detect_gpu_info()
     if not gpu_info["available"]:
-        if capacity_audit_required:
+        # Split serving: the audit/inference GPU is remote, so a GPU-less frontend
+        # is expected. Fall through to the explicit-config path instead of erroring.
+        if capacity_audit_required and not allow_no_gpu:
             bt.logging.error("Capacity audit is enabled but no CUDA GPU was detected")
             sys.exit(1)
         if model_id and quant and max_context_len:
